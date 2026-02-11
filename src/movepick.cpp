@@ -30,6 +30,17 @@ namespace Stockfish {
 
 namespace {
 
+// Tactical observation bonuses for move ordering.
+// These add explicit pattern-recognition bonuses on top of history heuristics.
+// Zero extra bitboard computation — all data already in Position state.
+namespace TacticalObs {
+    constexpr int PinnedCapture    = 300;    // capturing a pinned piece (tiebreaker)
+    constexpr int DiscoveredAttack = 450;    // moving blocker off enemy king ray
+    constexpr int ForkWithKing     = 500;    // knight fork including king
+    constexpr int Fork             = 350;    // knight fork on 2+ high-value pieces
+    constexpr int BackRank         = 200;    // R/Q to back rank when enemy king is there
+}
+
 enum Stages {
     // generate main search moves
     MAIN_TT,
@@ -152,8 +163,14 @@ ExtMove* MovePicker::score(MoveList<Type>& ml) {
         const Piece     capturedPiece = pos.piece_on(to);
 
         if constexpr (Type == CAPTURES)
+        {
             m.value = (*captureHistory)[pc][to][type_of(capturedPiece)]
                     + 7 * int(PieceValue[capturedPiece]);
+
+            // Bonus for capturing a pinned piece (it blocks its own king's ray)
+            if (pos.blockers_for_king(~us) & pos.pieces(~us) & to)
+                m.value += TacticalObs::PinnedCapture;
+        }
 
         else if constexpr (Type == QUIETS)
         {
@@ -177,6 +194,36 @@ ExtMove* MovePicker::score(MoveList<Type>& ml) {
 
             if (ply < LOW_PLY_HISTORY_SIZE)
                 m.value += 8 * (*lowPlyHistory)[ply][m.raw()] / (1 + ply);
+
+            // Tactical observation bonuses
+
+            // Discovered attack: our piece blocks a slider ray to enemy king.
+            // Moving it off that ray reveals an attack (possibly check).
+            if (pos.blockers_for_king(~us) & pos.pieces(us) & from)
+                m.value += TacticalObs::DiscoveredAttack;
+
+            // Knight fork: move to square attacking 2+ high-value enemy pieces
+            if (pt == KNIGHT)
+            {
+                Bitboard knightAtks = attacks_bb<KNIGHT>(to);
+                Bitboard highValue  = knightAtks & pos.pieces(~us)
+                                    & (pos.pieces(QUEEN) | pos.pieces(ROOK));
+                Bitboard hitsKing   = knightAtks & pos.square<KING>(~us);
+                if (hitsKing)
+                    highValue |= hitsKing;
+                if (more_than_one(highValue))
+                    m.value += hitsKing ? TacticalObs::ForkWithKing
+                                        : TacticalObs::Fork;
+            }
+
+            // Back rank attack: R/Q to enemy's back rank when king is there
+            if (pt == ROOK || pt == QUEEN)
+            {
+                Rank backRank = (us == WHITE) ? RANK_8 : RANK_1;
+                if (rank_of(to) == backRank
+                    && rank_of(pos.square<KING>(~us)) == backRank)
+                    m.value += TacticalObs::BackRank;
+            }
         }
 
         else  // Type == EVASIONS
