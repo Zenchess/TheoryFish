@@ -25,21 +25,26 @@
 #include "bitboard.h"
 #include "misc.h"
 #include "position.h"
+#include "tune.h"
 
 namespace Stockfish {
 
-namespace {
-
-// Tactical observation bonuses for move ordering.
+// Tactical observation bonuses for move ordering (SPSA-tunable).
 // These add explicit pattern-recognition bonuses on top of history heuristics.
 // Zero extra bitboard computation — all data already in Position state.
-namespace TacticalObs {
-    constexpr int PinnedCapture    = 300;    // capturing a pinned piece (tiebreaker)
-    constexpr int DiscoveredAttack = 450;    // moving blocker off enemy king ray
-    constexpr int ForkWithKing     = 500;    // knight fork including king
-    constexpr int Fork             = 350;    // knight fork on 2+ high-value pieces
-    constexpr int BackRank         = 200;    // R/Q to back rank when enemy king is there
-}
+int TactObs_PinnedCapture    = 300;   // capturing a pinned piece
+int TactObs_DiscoveredAttack = 450;   // moving blocker off enemy king ray
+int TactObs_ForkWithKing     = 500;   // knight fork including king
+int TactObs_Fork             = 350;   // knight fork on 2+ high-value pieces
+int TactObs_BackRank         = 200;   // R/Q to back rank when enemy king is there
+
+TUNE(SetRange(0, 1500), TactObs_PinnedCapture);
+TUNE(SetRange(0, 1500), TactObs_DiscoveredAttack);
+TUNE(SetRange(0, 1500), TactObs_ForkWithKing);
+TUNE(SetRange(0, 1500), TactObs_Fork);
+TUNE(SetRange(0, 1500), TactObs_BackRank);
+
+namespace {
 
 enum Stages {
     // generate main search moves
@@ -169,7 +174,7 @@ ExtMove* MovePicker::score(MoveList<Type>& ml) {
 
             // Bonus for capturing a pinned piece (it blocks its own king's ray)
             if (pos.blockers_for_king(~us) & pos.pieces(~us) & to)
-                m.value += TacticalObs::PinnedCapture;
+                m.value += TactObs_PinnedCapture;
         }
 
         else if constexpr (Type == QUIETS)
@@ -200,7 +205,7 @@ ExtMove* MovePicker::score(MoveList<Type>& ml) {
             // Discovered attack: our piece blocks a slider ray to enemy king.
             // Moving it off that ray reveals an attack (possibly check).
             if (pos.blockers_for_king(~us) & pos.pieces(us) & from)
-                m.value += TacticalObs::DiscoveredAttack;
+                m.value += TactObs_DiscoveredAttack;
 
             // Knight fork: move to square attacking 2+ high-value enemy pieces
             if (pt == KNIGHT)
@@ -212,8 +217,8 @@ ExtMove* MovePicker::score(MoveList<Type>& ml) {
                 if (hitsKing)
                     highValue |= hitsKing;
                 if (more_than_one(highValue))
-                    m.value += hitsKing ? TacticalObs::ForkWithKing
-                                        : TacticalObs::Fork;
+                    m.value += hitsKing ? TactObs_ForkWithKing
+                                        : TactObs_Fork;
             }
 
             // Back rank attack: R/Q to enemy's back rank when king is there
@@ -222,7 +227,7 @@ ExtMove* MovePicker::score(MoveList<Type>& ml) {
                 Rank backRank = (us == WHITE) ? RANK_8 : RANK_1;
                 if (rank_of(to) == backRank
                     && rank_of(pos.square<KING>(~us)) == backRank)
-                    m.value += TacticalObs::BackRank;
+                    m.value += TactObs_BackRank;
             }
         }
 
