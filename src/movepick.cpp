@@ -29,22 +29,36 @@
 
 namespace Stockfish {
 
-// Tactical observation bonuses for move ordering (SPSA-tunable).
-// These add explicit pattern-recognition bonuses on top of history heuristics.
-// Zero extra bitboard computation — all data already in Position state.
-int TactObs_PinnedCapture    = 300;   // capturing a pinned piece
-int TactObs_DiscoveredAttack = 450;   // moving blocker off enemy king ray
+// Tactical observation theory bonuses (SPSA-tunable).
+// When a theory fires, the move is promoted to a priority tier searched
+// before ALL non-theory quiets.  The bonus value orders moves WITHIN the
+// theory tier.  Zero disables that specific theory.
+//
+// The tier promotion constant (1 << 28) guarantees theory moves sort above
+// any history/check/threat score.  SPSA tunes the per-theory bonus only.
+
+// Quiet theories — move exploits a detected tactical pattern
+int TactObs_PinPressure      = 250;   // move attacks a pinned enemy piece
+int TactObs_DiscoveredAttack = 300;   // discoverer moves off the king ray
 int TactObs_ForkWithKing     = 500;   // knight fork including king
 int TactObs_Fork             = 350;   // knight fork on 2+ high-value pieces
-int TactObs_BackRank         = 200;   // R/Q to back rank when enemy king is there
+int TactObs_BackRank         = 250;   // R/Q to back rank when enemy king is there
 
-TUNE(SetRange(0, 1500), TactObs_PinnedCapture);
+// Capture theory
+int TactObs_PinnedCapture    = 300;   // capturing a pinned piece (can't recapture)
+
+TUNE(SetRange(0, 1500), TactObs_PinPressure);
 TUNE(SetRange(0, 1500), TactObs_DiscoveredAttack);
 TUNE(SetRange(0, 1500), TactObs_ForkWithKing);
 TUNE(SetRange(0, 1500), TactObs_Fork);
 TUNE(SetRange(0, 1500), TactObs_BackRank);
+TUNE(SetRange(0, 1500), TactObs_PinnedCapture);
 
 namespace {
+
+// Theory moves are promoted to this tier so they sort before all
+// non-theory quiet moves, regardless of history scores.
+constexpr int TheoryTier = 1 << 28;
 
 enum Stages {
     // generate main search moves
@@ -155,6 +169,24 @@ ExtMove* MovePicker::score(MoveList<Type>& ml) {
         threatByLesser[KING]  = pos.attacks_by<QUEEN>(~us) | threatByLesser[QUEEN];
     }
 
+    // ── Pre-compute tactical observations (once per scoring call) ──
+    // These reuse bitboards Stockfish already maintains — zero extra cost.
+    [[maybe_unused]] Bitboard pinnedEnemy, discoverers;
+    [[maybe_unused]] Square   enemyKingSq;
+    [[maybe_unused]] Rank     backRank;
+    [[maybe_unused]] bool     kingOnBackRank;
+    [[maybe_unused]] Bitboard occ;
+
+    if constexpr (Type == CAPTURES || Type == QUIETS)
+    {
+        pinnedEnemy    = pos.blockers_for_king(~us) & pos.pieces(~us);
+        discoverers    = pos.blockers_for_king(~us) & pos.pieces(us);
+        enemyKingSq   = pos.square<KING>(~us);
+        backRank       = (us == WHITE) ? RANK_8 : RANK_1;
+        kingOnBackRank = rank_of(enemyKingSq) == backRank;
+        occ            = pos.pieces();
+    }
+
     ExtMove* it = cur;
     for (auto move : ml)
     {
@@ -172,14 +204,15 @@ ExtMove* MovePicker::score(MoveList<Type>& ml) {
             m.value = (*captureHistory)[pc][to][type_of(capturedPiece)]
                     + 7 * int(PieceValue[capturedPiece]);
 
-            // Bonus for capturing a pinned piece (it blocks its own king's ray)
-            if (pos.blockers_for_king(~us) & pos.pieces(~us) & to)
+            // ExploitPinTheory (capture): pinned piece can't escape or
+            // recapture effectively — safe material gain.
+            if (TactObs_PinnedCapture && (pinnedEnemy & to))
                 m.value += TactObs_PinnedCapture;
         }
 
         else if constexpr (Type == QUIETS)
         {
-            // histories
+            // ── Standard history scoring (unchanged) ──
             m.value = 2 * (*mainHistory)[us][m.raw()];
             m.value += 2 * sharedHistory->pawn_entry(pos)[pc][to];
             m.value += (*continuationHistory[0])[pc][to];
@@ -196,39 +229,63 @@ ExtMove* MovePicker::score(MoveList<Type>& ml) {
             int v = threatByLesser[pt] & to ? -19 : 20 * bool(threatByLesser[pt] & from);
             m.value += PieceValue[pt] * v;
 
-
             if (ply < LOW_PLY_HISTORY_SIZE)
                 m.value += 8 * (*lowPlyHistory)[ply][m.raw()] / (1 + ply);
 
-            // Tactical observation bonuses
+            // ── Tactical theory scoring ──
+            // Each theory detects a positional pattern and identifies moves
+            // that exploit it.  When ANY theory fires, the move is promoted
+            // to a priority tier searched before all non-theory quiets.
+            // The per-theory bonus orders moves within the theory tier.
 
-            // Discovered attack: our piece blocks a slider ray to enemy king.
-            // Moving it off that ray reveals an attack (possibly check).
-            if (pos.blockers_for_king(~us) & pos.pieces(us) & from)
-                m.value += TactObs_DiscoveredAttack;
+            int theoryBonus = 0;
 
-            // Knight fork: move to square attacking 2+ high-value enemy pieces
+            // Compute attacks from the destination square (one lookup
+            // for non-sliders, one magic lookup for sliders).
+            Bitboard moveAtks = attacks_bb(pc, to, occ);
+
+            // ExploitPinTheory (pressure): ANY move whose destination
+            // attacks a pinned enemy piece.  The pinned piece cannot move
+            // to defend itself (absolute pin) or shouldn't (relative pin),
+            // so adding attackers wins material.
+            if (TactObs_PinPressure && pinnedEnemy && (moveAtks & pinnedEnemy))
+                theoryBonus += TactObs_PinPressure;
+
+            // DiscoveredAttackTheory: our piece blocks a slider ray to
+            // the enemy king.  Moving it OFF that ray reveals the attack.
+            // Moves along the ray don't create a discovery — filter them.
+            if (TactObs_DiscoveredAttack && (discoverers & from))
+            {
+                Bitboard ray = line_bb(from, enemyKingSq);
+                if (!(ray & to))   // moving OFF the ray → discovery
+                    theoryBonus += TactObs_DiscoveredAttack;
+            }
+
+            // ExecuteForkTheory: knight moves to a square attacking 2+
+            // high-value enemy pieces (K/Q/R).  Fork with king forces
+            // the king to move, guaranteeing material gain.
             if (pt == KNIGHT)
             {
                 Bitboard knightAtks = attacks_bb<KNIGHT>(to);
                 Bitboard highValue  = knightAtks & pos.pieces(~us)
                                     & (pos.pieces(QUEEN) | pos.pieces(ROOK));
-                Bitboard hitsKing   = knightAtks & pos.square<KING>(~us);
+                Bitboard hitsKing   = knightAtks & enemyKingSq;
                 if (hitsKing)
                     highValue |= hitsKing;
                 if (more_than_one(highValue))
-                    m.value += hitsKing ? TactObs_ForkWithKing
-                                        : TactObs_Fork;
+                    theoryBonus += hitsKing ? TactObs_ForkWithKing
+                                            : TactObs_Fork;
             }
 
-            // Back rank attack: R/Q to enemy's back rank when king is there
-            if (pt == ROOK || pt == QUEEN)
-            {
-                Rank backRank = (us == WHITE) ? RANK_8 : RANK_1;
-                if (rank_of(to) == backRank
-                    && rank_of(pos.square<KING>(~us)) == backRank)
-                    m.value += TactObs_BackRank;
-            }
+            // BackRankAttackTheory: R/Q to enemy's back rank when the
+            // king is confined there — threatens back rank mate.
+            if (TactObs_BackRank && kingOnBackRank
+                && (pt == ROOK || pt == QUEEN) && rank_of(to) == backRank)
+                theoryBonus += TactObs_BackRank;
+
+            // Promote theory moves to priority tier
+            if (theoryBonus > 0)
+                m.value += TheoryTier + theoryBonus;
         }
 
         else  // Type == EVASIONS
